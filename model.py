@@ -37,6 +37,8 @@ class Product:
     particle_d_um: tuple
     particle_mass_frac: tuple
     initial_solvent_kg: dict
+    initial_dimethicone_kg: float = 0.0
+    extractable_dimethicone_fraction: float = 0.5
 
 @dataclass
 class Recipe:
@@ -46,6 +48,9 @@ class Recipe:
     nitrogen_slpm: float
     jacket_profile: list  # [(hour, C), ...]
     agitation_interval_min: float = 30.0
+    dimethicone_extraction_h: float = 6.0
+    dimethicone_k_leach_h: float = 0.20
+    dimethicone_partition_factor: float = 1.0
 
 
 def psat_Pa(solvent, T_C):
@@ -88,6 +93,67 @@ def dynamic_tg_C(prod, solvent_mass):
         wi=max(m,0)/total; num += k[s]*wi*SOLVENTS[s]['Tg']; den += k[s]*wi
     return num/max(den,1e-9)-273.15
 
+def simulate_dimethicone_washes(eq, prod, cycles):
+    """Discrete equilibrium-plus-kinetic wash model.
+
+    K_L_per_kg is C_liquid/C_solid expressed as L/kg. Each cycle performs
+    finite-rate approach to partition equilibrium, followed by incomplete drain.
+    """
+    total=max(float(prod.initial_dimethicone_kg),0.0)
+    extractable=total*float(np.clip(prod.extractable_dimethicone_fraction,0.0,1.0))
+    bound=total-extractable
+    solid_mobile=extractable
+    liquid_carry=0.0
+    recovered=0.0
+    elapsed=0.0
+    rows=[]
+    for idx,c in enumerate(cycles,1):
+        name=str(c.get('name',f'Wash {idx}'))
+        volume_L=max(float(c.get('volume_L',0.0)),0.0)
+        retained_L=max(float(c.get('retained_L',0.0)),0.0)
+        contact_min=max(float(c.get('contact_min',0.0)),0.0)
+        rpm=max(float(c.get('rpm',eq.rpm)),0.0)
+        tilt_deg=float(c.get('tilt_deg',eq.tilt_deg if 'OMCA' in eq.name.upper() else 0.0))
+        temp_C=float(c.get('temp_C',25.0))
+        K=max(float(c.get('K_L_per_kg',1.0)),0.0)
+        kla_h=max(float(c.get('kLa_1_per_h',0.25)),0.0)
+        drain_fraction=float(np.clip(c.get('drain_fraction',0.95),0.0,1.0))
+        total_liquid_L=max(volume_L+retained_L,1e-12)
+        available=solid_mobile+liquid_carry
+        # Equilibrium: C_liq = K*C_solid, giving fraction in liquid below.
+        f_liq_eq=(K*total_liquid_L)/(max(prod.dry_mass_kg,1e-12)+K*total_liquid_L)
+        liquid_eq=available*f_liq_eq
+        hydro=(1.0+0.010*rpm)
+        if 'OMCA' in eq.name.upper(): hydro*=1.0+0.35*abs(math.sin(math.radians(tilt_deg)))
+        temp_factor=math.exp(2000.0/8.314*(1/298.15-1/(temp_C+273.15)))
+        approach=1.0-math.exp(-kla_h*hydro*temp_factor*contact_min/60.0)
+        liquid_after=liquid_carry+(liquid_eq-liquid_carry)*approach
+        liquid_after=float(np.clip(liquid_after,0.0,available))
+        solid_mobile=available-liquid_after
+        drained=liquid_after*drain_fraction
+        liquid_carry=liquid_after-drained
+        recovered+=drained
+        elapsed+=contact_min/60.0
+        retained=bound+solid_mobile+liquid_carry
+        rows.append({
+            'cycle':idx,'name':name,'elapsed_h':elapsed,'wash_volume_L':volume_L,
+            'retained_liquid_L':retained_L,'contact_min':contact_min,'rpm':rpm,
+            'tilt_deg':tilt_deg,'temperature_C':temp_C,'K_L_per_kg':K,
+            'kLa_1_per_h':kla_h,'drain_fraction':drain_fraction,
+            'equilibrium_liquid_fraction':f_liq_eq,'kinetic_approach_fraction':approach,
+            'dimethicone_recovered_this_cycle_g':drained*1000,
+            'dimethicone_recovered_cumulative_g':recovered*1000,
+            'dimethicone_carryover_g':liquid_carry*1000,
+            'dimethicone_in_solids_g':(bound+solid_mobile)*1000,
+            'dimethicone_retained_total_g':retained*1000,
+            'dimethicone_retained_ppm':retained/max(prod.dry_mass_kg,1e-12)*1e6,
+            'extraction_percent':100*recovered/max(total,1e-12),
+            'mass_balance_percent':100*(recovered+retained)/max(total,1e-12),
+        })
+    return pd.DataFrame(rows), {'bound_kg':bound,'solid_mobile_kg':solid_mobile,
+        'liquid_carry_kg':liquid_carry,'recovered_kg':recovered,
+        'retained_kg':bound+solid_mobile+liquid_carry,'total_kg':total}
+
 def simulate(eq:Equipment, prod:Product, rec:Recipe, diffusivity=None):
     diffusivity=diffusivity or {'DCM':2.0e-14,'Ethanol':8.0e-15,'Heptane':5.0e-15}
     depth, free_area, wall_contact, filter_cover=cake_geometry(eq,prod)
@@ -97,6 +163,10 @@ def simulate(eq:Equipment, prod:Product, rec:Recipe, diffusivity=None):
     # solvent mass by size bin
     m={s:prod.initial_solvent_kg.get(s,0)*wf.copy() for s in SOLVENTS}
     T=25.0; head={s:0.0 for s in SOLVENTS}; condensate={s:0.0 for s in SOLVENTS}
+    dim_total=max(prod.initial_dimethicone_kg,0.0)
+    dim_extractable=dim_total*np.clip(prod.extractable_dimethicone_fraction,0.0,1.0)
+    dim_bound=dim_total-dim_extractable
+    dim_extracted=0.0
     rows=[]
     gas_R=8.314
     for q in range(n):
@@ -109,6 +179,14 @@ def simulate(eq:Equipment, prod:Product, rec:Recipe, diffusivity=None):
             contact_factor=0.65+0.35*filter_cover
         else:
             redistribution=ag_factor; contact_factor=1.0
+        # Dimethicone/PDMS is handled as liquid-phase leaching, not vacuum evaporation.
+        # Extraction is active only during the configured wash/extraction period.
+        if hour < rec.dimethicone_extraction_h and dim_extractable > 0:
+            k_leach=max(rec.dimethicone_k_leach_h,0.0)/3600.0
+            hydrodynamic=(1.0+0.010*eq.rpm) if ag_on else 1.0
+            if 'OMCA' in eq.name.upper(): hydrodynamic*=1.0+0.35*abs(math.sin(math.radians(eq.tilt_deg)))
+            dm_dim=min(dim_extractable, k_leach*hydrodynamic*max(rec.dimethicone_partition_factor,0.0)*dim_extractable*dt)
+            dim_extractable-=dm_dim; dim_extracted+=dm_dim
         # vapor headspace partial pressures from moles
         Ppart={s:head[s]*gas_R*(T+273.15)/max(eq.headspace_m3,1e-8) for s in SOLVENTS}
         rates={}; total_latent=0.0
@@ -140,8 +218,12 @@ def simulate(eq:Equipment, prod:Product, rec:Recipe, diffusivity=None):
         T += (qheat-total_latent)*dt/max(Ctot,1.0)
         T=float(np.clip(T,-20,Tj+2))
         smass={s:float(m[s].sum()) for s in SOLVENTS}; tg=dynamic_tg_C(prod,smass)
+        dim_retained=dim_bound+dim_extractable
         row={'time_h':hour,'jacket_C':Tj,'product_C':T,'Tg_C':tg,'Tg_margin_C':tg-T,'cake_depth_mm':depth*1000,
-             'free_area_m2':free_area,'filter_coverage':filter_cover,'agitation_on':ag_on,'heat_W':qheat,'latent_W':total_latent}
+             'free_area_m2':free_area,'filter_coverage':filter_cover,'agitation_on':ag_on,'heat_W':qheat,'latent_W':total_latent,
+             'Dimethicone_retained_ppm':dim_retained/prod.dry_mass_kg*1e6,
+             'Dimethicone_extracted_g':dim_extracted*1000,
+             'Dimethicone_extraction_percent':100*dim_extracted/max(dim_total,1e-12)}
         for s in SOLVENTS:
             row[f'{s}_ppm']=smass[s]/prod.dry_mass_kg*1e6
             row[f'{s}_rate_gph']=rates[s]*3.6e6
@@ -157,7 +239,6 @@ def defaults(kind='Rosenmund'):
     else:
         # OMCA dimensions are editable placeholders pending approved dimensional schedule
         eq=Equipment('OMCA tilting ANFD',0.05,0.32,0.55,0.040,6.0,12.0,2.5,0.002,5.0,25,30,0.5)
-    prod=Product(1.8,450,0.45,1400,0.12,48,(20,60,120),(0.2,0.6,0.2),{'DCM':0.045,'Ethanol':0.030,'Heptane':0.120})
-    rec=Recipe(80,60,80,1.0,[(0,25),(8,30),(20,35),(36,40),(56,43),(76,43),(80,25)],30)
+    prod=Product(1.8,450,0.45,1400,0.12,48,(20,60,120),(0.2,0.6,0.2),{'DCM':0.045,'Ethanol':0.030,'Heptane':0.120},0.018,0.60)
+    rec=Recipe(80,60,80,1.0,[(0,25),(8,30),(20,35),(36,40),(56,43),(76,43),(80,25)],30,6.0,0.20,1.0)
     return eq,prod,rec
-
